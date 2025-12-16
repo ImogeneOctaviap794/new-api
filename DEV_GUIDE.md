@@ -56,15 +56,42 @@ docker build -t yinghua001/new-api:latest .
 docker push yinghua001/new-api:latest
 ```
 
-### 4. 服务器部署
+### 4. 本地开发环境
 
 ```bash
-# SSH 到 Node2
-sshpass -p 'f3t7uCBeTCizT12' ssh -p 22222 root@152.53.240.159
+# 启动本地 new-api（连接本地 MySQL）
+docker run -d --name new-api-dev \
+  -p 3001:3000 \
+  -e SQL_DSN="root:123456@tcp(host.docker.internal:3306)/new_api_dev" \
+  -e SESSION_SECRET="dev-session-secret" \
+  yinghua001/new-api:latest
 
-# 拉取新镜像并重启（根据实际部署方式调整）
-docker pull yinghua001/new-api:latest
-kubectl rollout restart deployment/new-api -n one-api
+# 查看日志
+docker logs -f new-api-dev
+
+# 停止并删除
+docker stop new-api-dev && docker rm new-api-dev
+```
+
+本地 MySQL 信息：
+- 容器名：mysql
+- Root 密码：123456
+- 开发数据库：new_api_dev
+- 访问地址：http://localhost:3001
+
+### 5. 服务器部署
+
+```bash
+# 更新 new-api-v3
+kubectl set image deployment/new-api-v3 -n one-api new-api=yinghua001/new-api:latest
+kubectl rollout status deployment/new-api-v3 -n one-api
+
+# 更新 new-api-horizon（商业服务，谨慎）
+kubectl set image deployment/new-api-horizon -n one-api new-api-horizon=yinghua001/new-api:latest
+kubectl rollout status deployment/new-api-horizon -n one-api
+
+# 或使用滚动重启（镜像不变时）
+kubectl rollout restart deployment/new-api-v3 -n one-api
 ```
 
 ## 项目结构
