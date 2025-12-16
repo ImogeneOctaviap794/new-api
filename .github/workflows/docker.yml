@@ -27,7 +27,12 @@ jobs:
 
       - name: Get version
         id: version
-        run: echo "VERSION=$(cat VERSION 2>/dev/null || echo 'latest')" >> $GITHUB_OUTPUT
+        run: |
+          VER=$(cat VERSION 2>/dev/null | tr -d '[:space:]')
+          if [ -z "$VER" ]; then
+            VER=$(date +%Y%m%d)
+          fi
+          echo "VERSION=$VER" >> $GITHUB_OUTPUT
 
       - name: Build and push
         uses: docker/build-push-action@v5
