@@ -194,9 +194,8 @@ func generateStopBlock(index int) *dto.ClaudeResponse {
 }
 
 func StreamResponseOpenAI2Claude(openAIResponse *dto.ChatCompletionsStreamResponse, info *relaycommon.RelayInfo) []*dto.ClaudeResponse {
-	if info.ClaudeConvertInfo.Done {
-		return nil
-	}
+	// 注意：不再在开头检查 Done，因为 HandleFinalResponse 需要在 Done=true 时生成 stop 事件
+	// Done 的检查现在移到了函数内部的适当位置
 
 	var claudeResponses []*dto.ClaudeResponse
 	if info.SendResponseCount == 1 {

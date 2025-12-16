@@ -208,7 +208,6 @@ func HandleFinalResponse(c *gin.Context, info *relaycommon.RelayInfo, lastStream
 		helper.Done(c)
 
 	case types.RelayFormatClaude:
-		info.ClaudeConvertInfo.Done = true
 		var streamResponse dto.ChatCompletionsStreamResponse
 		if err := common.Unmarshal(common.StringToByteSlice(lastStreamData), &streamResponse); err != nil {
 			common.SysLog("error unmarshalling stream response: " + err.Error())
@@ -216,6 +215,8 @@ func HandleFinalResponse(c *gin.Context, info *relaycommon.RelayInfo, lastStream
 		}
 
 		info.ClaudeConvertInfo.Usage = usage
+		// 设置 Done 为 true，让 StreamResponseOpenAI2Claude 生成 stop 事件
+		info.ClaudeConvertInfo.Done = true
 
 		claudeResponses := service.StreamResponseOpenAI2Claude(&streamResponse, info)
 		for _, resp := range claudeResponses {

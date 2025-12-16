@@ -182,6 +182,10 @@ new-api/
 - dto/openai_request.go          # 添加 ThinkingBlocks 结构体
 - service/convert.go             # ClaudeToOpenAI: thinking->reasoning 转换
                                  # ResponseOpenAI2Claude: reasoning_content->thinking 转换 (含 signature)
+
+# 2025-12-17: Claude 流式响应修复 (Claude Code 兼容)
+- service/convert.go             # 修复 StreamResponseOpenAI2Claude 在 Done=true 时提前返回的问题
+                                 # 确保流式响应包含完整的 stop 事件序列
 ```
 
 ### Extended Thinking 功能说明
