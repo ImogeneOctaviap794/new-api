@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"strings"
 	"time"
 
@@ -152,6 +153,11 @@ func TextHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIError *types
 
 		logger.LogDebug(c, fmt.Sprintf("text request body: %s", string(jsonData)))
 
+		// DEBUG: 保存请求体到文件用于调试
+		debugFile := "/tmp/new-api-openai-request.json"
+		if err := os.WriteFile(debugFile, jsonData, 0644); err == nil {
+			fmt.Printf("[DEBUG] OpenAI request saved to %s (len=%d)\n", debugFile, len(jsonData))
+		}
 		requestBody = bytes.NewBuffer(jsonData)
 	}
 

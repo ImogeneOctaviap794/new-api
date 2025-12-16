@@ -178,9 +178,42 @@ new-api/
 记录你的二开改动，方便合并时参考：
 
 ```
-# 示例格式
-# - relay/channel/xxx.go  # 新增渠道
-# - web/src/xxx.tsx       # UI 修改
+# 2025-12-17: Extended Thinking 支持 (Snowflake Cortex 兼容)
+- dto/openai_request.go          # 添加 ThinkingBlocks 结构体
+- service/convert.go             # ClaudeToOpenAI: thinking->reasoning 转换
+                                 # ResponseOpenAI2Claude: reasoning_content->thinking 转换 (含 signature)
+```
+
+### Extended Thinking 功能说明
+
+**目的**: 让 OpenAI 格式渠道（如 snowflake-proxy）支持 Claude 风格的 thinking 参数。
+
+**修改内容**:
+
+| 文件 | 修改 | 说明 |
+|------|------|------|
+| `dto/openai_request.go` | 添加 `ThinkingBlocks` 字段 | 解析 OpenAI 响应中的 `thinking_blocks` |
+| `service/convert.go` | `ClaudeToOpenAIRequest` | 将 Claude `thinking` 参数转为 OpenAI `reasoning` 参数 |
+| `service/convert.go` | `ResponseOpenAI2Claude` | 将 OpenAI `thinking_blocks`/`reasoning_content` 转为 Claude `thinking` 内容块 (含 `signature`) |
+
+**影响范围**:
+- ✅ 只影响 **OpenAI 渠道处理 Claude 格式请求** 的场景
+- ❌ 不影响正常的 Claude 渠道 (类型 14)
+
+**使用方式**:
+```bash
+# Claude 格式请求 + thinking 参数
+curl -X POST 'http://xxx/v1/messages' -d '{
+  "model": "claude-xxx",
+  "thinking": {"type": "enabled", "budget_tokens": 1024},
+  ...
+}'
+
+# 或使用 -thinking 后缀 (snowflake-proxy 支持)
+curl -X POST 'http://xxx/v1/chat/completions' -d '{
+  "model": "claude-xxx-thinking",
+  ...
+}'
 ```
 
 ## 联系 AI 续接上下文

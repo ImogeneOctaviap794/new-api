@@ -23,23 +23,16 @@ func ClaudeToOpenAIRequest(claudeRequest dto.ClaudeRequest, info *relaycommon.Re
 
 	isOpenRouter := info.ChannelType == constant.ChannelTypeOpenRouter
 
+	// 统一处理 thinking -> reasoning 转换，支持所有渠道类型
 	if claudeRequest.Thinking != nil && claudeRequest.Thinking.Type == "enabled" {
-		if isOpenRouter {
-			reasoning := openrouter.RequestReasoning{
-				MaxTokens: claudeRequest.Thinking.GetBudgetTokens(),
-			}
-			reasoningJSON, err := json.Marshal(reasoning)
-			if err != nil {
-				return nil, fmt.Errorf("failed to marshal reasoning: %w", err)
-			}
-			openAIRequest.Reasoning = reasoningJSON
-		} else {
-			thinkingSuffix := "-thinking"
-			if strings.HasSuffix(info.OriginModelName, thinkingSuffix) &&
-				!strings.HasSuffix(openAIRequest.Model, thinkingSuffix) {
-				openAIRequest.Model = openAIRequest.Model + thinkingSuffix
-			}
+		reasoning := openrouter.RequestReasoning{
+			MaxTokens: claudeRequest.Thinking.GetBudgetTokens(),
 		}
+		reasoningJSON, err := json.Marshal(reasoning)
+		if err != nil {
+			return nil, fmt.Errorf("failed to marshal reasoning: %w", err)
+		}
+		openAIRequest.Reasoning = reasoningJSON
 	}
 
 	// Convert stop sequences
@@ -519,6 +512,30 @@ func ResponseOpenAI2Claude(openAIResponse *dto.OpenAITextResponse, info *relayco
 				contents = append(contents, claudeContent)
 			}
 		} else {
+			// 处理 thinking_blocks (包含 signature)
+			if len(choice.Message.ThinkingBlocks) > 0 {
+				for _, block := range choice.Message.ThinkingBlocks {
+					thinkingContent := dto.ClaudeMediaMessage{}
+					thinkingContent.Type = "thinking"
+					thinking := block.Thinking
+					thinkingContent.Thinking = &thinking
+					thinkingContent.Signature = block.Signature
+					contents = append(contents, thinkingContent)
+				}
+			} else {
+				// 回退到 reasoning_content (不包含 signature)
+				reasoningContent := choice.Message.ReasoningContent
+				if reasoningContent == "" {
+					reasoningContent = choice.Message.Reasoning
+				}
+				if reasoningContent != "" {
+					thinkingContent := dto.ClaudeMediaMessage{}
+					thinkingContent.Type = "thinking"
+					thinkingContent.Thinking = &reasoningContent
+					contents = append(contents, thinkingContent)
+				}
+			}
+			// 处理 text content
 			claudeContent := dto.ClaudeMediaMessage{}
 			claudeContent.Type = "text"
 			claudeContent.SetText(choice.Message.StringContent())

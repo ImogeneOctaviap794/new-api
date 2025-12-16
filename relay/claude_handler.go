@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"strings"
 
 	"github.com/QuantumNous/new-api/common"
@@ -131,6 +132,11 @@ func ClaudeHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIError *typ
 
 		if common.DebugEnabled {
 			println("requestBody: ", string(jsonData))
+		}
+		// DEBUG: 保存请求体到文件用于调试
+		debugFile := "/tmp/new-api-claude-request.json"
+		if err := os.WriteFile(debugFile, jsonData, 0644); err == nil {
+			fmt.Printf("[DEBUG] Claude request saved to %s (len=%d)\n", debugFile, len(jsonData))
 		}
 		requestBody = bytes.NewBuffer(jsonData)
 	}
