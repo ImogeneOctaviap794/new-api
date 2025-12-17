@@ -2,7 +2,7 @@ name: Build and Push Docker Image
 
 on:
   push:
-    branches: [main]
+    branches: [main, cache]
   workflow_dispatch:  # 允许手动触发
 
 env:
@@ -25,7 +25,7 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      - name: Get version
+      - name: Get version and tags
         id: version
         run: |
           VER=$(cat VERSION 2>/dev/null | tr -d '[:space:]')
@@ -33,6 +33,14 @@ jobs:
             VER=$(date +%Y%m%d)
           fi
           echo "VERSION=$VER" >> $GITHUB_OUTPUT
+          
+          # 根据分支决定标签
+          BRANCH=${GITHUB_REF#refs/heads/}
+          if [ "$BRANCH" = "cache" ]; then
+            echo "TAGS=${{ env.DOCKER_IMAGE }}:v1-cache,${{ env.DOCKER_IMAGE }}:cache-$VER" >> $GITHUB_OUTPUT
+          else
+            echo "TAGS=${{ env.DOCKER_IMAGE }}:latest,${{ env.DOCKER_IMAGE }}:$VER" >> $GITHUB_OUTPUT
+          fi
 
       - name: Build and push
         uses: docker/build-push-action@v5
@@ -40,8 +48,6 @@ jobs:
           context: .
           platforms: linux/amd64
           push: true
-          tags: |
-            ${{ env.DOCKER_IMAGE }}:latest
-            ${{ env.DOCKER_IMAGE }}:${{ steps.version.outputs.VERSION }}
+          tags: ${{ steps.version.outputs.TAGS }}
           cache-from: type=gha
           cache-to: type=gha,mode=max

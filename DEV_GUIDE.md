@@ -186,6 +186,14 @@ new-api/
 # 2025-12-17: Claude 流式响应修复 (Claude Code 兼容)
 - service/convert.go             # 修复 StreamResponseOpenAI2Claude 在 Done=true 时提前返回的问题
                                  # 确保流式响应包含完整的 stop 事件序列
+
+# 2025-12-17: Claude Prompt 缓存计费逻辑 (cache 分支)
+- relay/channel/claude/adaptor.go       # ConvertClaudeRequest 调用缓存注入
+- relay/channel/claude/relay-claude.go  # CalculateCacheTokensFromRequest 函数
+                                        # 根据请求中 cache_control 计算 token 数
+                                        # 内存缓存记录 prompt hash，区分首次/后续请求
+- relay/claude_handler.go               # 调用缓存计算，填充 usage 字段
+- .github/workflows/docker.yml          # 支持 cache 分支构建，标签 v1-cache
 ```
 
 ### Extended Thinking 功能说明
