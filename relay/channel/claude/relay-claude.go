@@ -1016,5 +1016,25 @@ func CalculateCacheTokensFromRequest(claudeRequest *dto.ClaudeRequest, model str
 		}
 	}
 
+	// 3. 检查 tools 中带 cache_control 的内容
+	if claudeRequest.Tools != nil {
+		tools := claudeRequest.GetTools()
+		normalTools, _ := dto.ProcessTools(tools)
+		for _, tool := range normalTools {
+			if len(tool.CacheControl) > 0 {
+				// 计算工具的 token 数：name + description + input_schema
+				toolText := tool.Name
+				if tool.Description != "" {
+					toolText += " " + tool.Description
+				}
+				if tool.InputSchema != nil {
+					schemaBytes, _ := json.Marshal(tool.InputSchema)
+					toolText += " " + string(schemaBytes)
+				}
+				totalCacheTokens += service.CountTextToken(toolText, model)
+			}
+		}
+	}
+
 	return totalCacheTokens
 }
