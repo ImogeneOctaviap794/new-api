@@ -5,12 +5,12 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"os"
 	"strings"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/dto"
+	"github.com/QuantumNous/new-api/relay/channel/claude"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relay/helper"
 	"github.com/QuantumNous/new-api/service"
@@ -133,11 +133,6 @@ func ClaudeHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIError *typ
 		if common.DebugEnabled {
 			println("requestBody: ", string(jsonData))
 		}
-		// DEBUG: 保存请求体到文件用于调试
-		debugFile := "/tmp/new-api-claude-request.json"
-		if err := os.WriteFile(debugFile, jsonData, 0644); err == nil {
-			fmt.Printf("[DEBUG] Claude request saved to %s (len=%d)\n", debugFile, len(jsonData))
-		}
 		requestBody = bytes.NewBuffer(jsonData)
 	}
 
@@ -167,6 +162,26 @@ func ClaudeHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIError *typ
 		return newAPIError
 	}
 
-	service.PostClaudeConsumeQuota(c, info, usage.(*dto.Usage))
+	// 根据请求中 cache_control 计算缓存 token（不依赖上游返回）
+	usageData := usage.(*dto.Usage)
+	cacheCreation, cacheRead, ttl := claude.CalculateCacheTokensFromRequest(claudeReq, info.OriginModelName)
+	
+	// 如果上游没有返回缓存信息，使用本地计算的值
+	if usageData.PromptTokensDetails.CachedCreationTokens == 0 && usageData.PromptTokensDetails.CachedTokens == 0 {
+		if cacheCreation > 0 {
+			// 首次请求，写入缓存
+			usageData.PromptTokensDetails.CachedCreationTokens = cacheCreation
+			if ttl == "1h" {
+				usageData.ClaudeCacheCreation1hTokens = cacheCreation
+			} else {
+				usageData.ClaudeCacheCreation5mTokens = cacheCreation
+			}
+		} else if cacheRead > 0 {
+			// 后续请求，读取缓存
+			usageData.PromptTokensDetails.CachedTokens = cacheRead
+		}
+	}
+
+	service.PostClaudeConsumeQuota(c, info, usageData)
 	return nil
 }

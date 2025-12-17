@@ -1,11 +1,15 @@
 package claude
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/dto"
@@ -25,6 +29,146 @@ const (
 	WebSearchMaxUsesMedium = 5
 	WebSearchMaxUsesHigh   = 10
 )
+
+func buildClaudeCacheControl(ttl string) json.RawMessage {
+	if ttl != "" && ttl != "5m" && ttl != "1h" {
+		ttl = ""
+	}
+	if ttl == "" {
+		return json.RawMessage(`{"type":"ephemeral"}`)
+	}
+	b, err := json.Marshal(map[string]string{"type": "ephemeral", "ttl": ttl})
+	if err != nil {
+		return json.RawMessage(`{"type":"ephemeral"}`)
+	}
+	return b
+}
+
+func applyCacheControlInjectionPoints(c *gin.Context, claudeRequest *dto.ClaudeRequest) {
+	originModelName := c.GetString("original_model")
+	claudeSettings := model_setting.GetClaudeSettings()
+	points := claudeSettings.GetCacheControlInjectionPoints(originModelName)
+	if len(points) == 0 && claudeRequest.Model != originModelName {
+		points = claudeSettings.GetCacheControlInjectionPoints(claudeRequest.Model)
+	}
+	if len(points) == 0 {
+		return
+	}
+	if c.Request.Header.Get("anthropic-beta") == "" {
+		c.Request.Header.Set("anthropic-beta", "prompt-caching-2024-07-31")
+	}
+
+	for _, point := range points {
+		location := strings.ToLower(point.Location)
+		role := strings.ToLower(point.Role)
+		if location == "message" && role == "system" {
+			location = "system"
+		}
+		cacheControl := buildClaudeCacheControl(point.Ttl)
+
+		switch location {
+		case "system":
+			var systemContent []dto.ClaudeMediaMessage
+			switch system := claudeRequest.System.(type) {
+			case string:
+				if strings.TrimSpace(system) == "" {
+					continue
+				}
+				text := system
+				systemContent = []dto.ClaudeMediaMessage{{Type: "text", Text: &text}}
+			case []dto.ClaudeMediaMessage:
+				systemContent = system
+			default:
+				systemContent = claudeRequest.ParseSystem()
+			}
+			if len(systemContent) == 0 {
+				continue
+			}
+			idx := -1
+			if point.Index != nil {
+				idx = *point.Index
+			}
+			if idx < 0 {
+				idx = len(systemContent) + idx
+			}
+			if idx < 0 || idx >= len(systemContent) {
+				continue
+			}
+			if len(systemContent[idx].CacheControl) == 0 {
+				systemContent[idx].CacheControl = cacheControl
+			}
+			claudeRequest.System = systemContent
+		case "message", "messages":
+			if len(claudeRequest.Messages) == 0 {
+				continue
+			}
+			candidateMsgIndexes := make([]int, 0, len(claudeRequest.Messages))
+			if role != "" {
+				for i, m := range claudeRequest.Messages {
+					if strings.ToLower(m.Role) == role {
+						candidateMsgIndexes = append(candidateMsgIndexes, i)
+					}
+				}
+			} else {
+				for i := range claudeRequest.Messages {
+					candidateMsgIndexes = append(candidateMsgIndexes, i)
+				}
+			}
+			if len(candidateMsgIndexes) == 0 {
+				continue
+			}
+			idx := -1
+			if point.Index != nil {
+				idx = *point.Index
+			}
+			if idx < 0 {
+				idx = len(candidateMsgIndexes) + idx
+			}
+			if idx < 0 || idx >= len(candidateMsgIndexes) {
+				continue
+			}
+			msgIndex := candidateMsgIndexes[idx]
+			msg := claudeRequest.Messages[msgIndex]
+
+			switch content := msg.Content.(type) {
+			case string:
+				if content == "" {
+					continue
+				}
+				text := content
+				msg.Content = []dto.ClaudeMediaMessage{
+					{
+						Type:         "text",
+						Text:         &text,
+						CacheControl: cacheControl,
+					},
+				}
+				claudeRequest.Messages[msgIndex] = msg
+			case []dto.ClaudeMediaMessage:
+				if len(content) == 0 {
+					continue
+				}
+				blockIndex := len(content) - 1
+				if len(content[blockIndex].CacheControl) == 0 {
+					content[blockIndex].CacheControl = cacheControl
+				}
+				msg.Content = content
+				claudeRequest.Messages[msgIndex] = msg
+			default:
+				parsed, err := msg.ParseContent()
+				if err != nil || len(parsed) == 0 {
+					continue
+				}
+				blockIndex := len(parsed) - 1
+				if len(parsed[blockIndex].CacheControl) == 0 {
+					parsed[blockIndex].CacheControl = cacheControl
+				}
+				msg.Content = parsed
+				claudeRequest.Messages[msgIndex] = msg
+			}
+		}
+	}
+}
 
 func stopReasonClaude2OpenAI(reason string) string {
 	switch reason {
@@ -294,7 +438,8 @@ func RequestOpenAI2ClaudeMessage(c *gin.Context, textRequest dto.GeneralOpenAIRe
 					if ctx.Type == "text" {
 						systemMessages = append(systemMessages, dto.ClaudeMediaMessage{
 							Type: "text",
-							Text: common.GetPointer[string](ctx.Text),
+							Text:         common.GetPointer[string](ctx.Text),
+							CacheControl: ctx.CacheControl,
 						})
 					}
 					// 未来可以在这里扩展对图片等其他类型的支持
@@ -354,7 +499,8 @@ func RequestOpenAI2ClaudeMessage(c *gin.Context, textRequest dto.GeneralOpenAIRe
 				claudeMediaMessages := make([]dto.ClaudeMediaMessage, 0)
 				for _, mediaMessage := range message.ParseContent() {
 					claudeMediaMessage := dto.ClaudeMediaMessage{
-						Type: mediaMessage.Type,
+						Type:         mediaMessage.Type,
+						CacheControl: mediaMessage.CacheControl,
 					}
 					if mediaMessage.Type == "text" {
 						claudeMediaMessage.Text = common.GetPointer[string](mediaMessage.Text)
@@ -412,6 +558,7 @@ func RequestOpenAI2ClaudeMessage(c *gin.Context, textRequest dto.GeneralOpenAIRe
 
 	claudeRequest.Prompt = ""
 	claudeRequest.Messages = claudeMessages
+	applyCacheControlInjectionPoints(c, &claudeRequest)
 	return &claudeRequest, nil
 }
 
@@ -835,4 +982,110 @@ func mapToolChoice(toolChoice any, parallelToolCalls *bool) *dto.ClaudeToolChoic
 	}
 
 	return claudeToolChoice
+}
+
+// promptCacheStore 存储已缓存的 prompt hash 及其过期时间
+var promptCacheStore sync.Map // map[string]time.Time
+
+// CalculateCacheTokensFromRequest 根据请求中带 cache_control 的内容计算 token 数
+// 返回 (cacheCreationTokens, cacheReadTokens, ttl)
+// 首次请求返回 cacheCreation，后续相同内容返回 cacheRead
+func CalculateCacheTokensFromRequest(claudeRequest *dto.ClaudeRequest, model string) (int, int, string) {
+	if claudeRequest == nil {
+		return 0, 0, ""
+	}
+
+	totalCacheTokens := 0
+	ttl := ""
+	var cacheContentBuilder strings.Builder
+
+	// 1. 检查 system 中带 cache_control 的内容
+	systemContent := claudeRequest.ParseSystem()
+	for _, block := range systemContent {
+		if len(block.CacheControl) > 0 {
+			text := block.GetText()
+			if text != "" {
+				totalCacheTokens += service.CountTextToken(text, model)
+				cacheContentBuilder.WriteString(text)
+			}
+			// 解析 ttl
+			if ttl == "" {
+				var cc map[string]string
+				if json.Unmarshal(block.CacheControl, &cc) == nil {
+					if t, ok := cc["ttl"]; ok && (t == "5m" || t == "1h") {
+						ttl = t
+					}
+				}
+			}
+		}
+	}
+
+	// 2. 检查 messages 中带 cache_control 的内容
+	for _, msg := range claudeRequest.Messages {
+		contentBlocks, err := msg.ParseContent()
+		if err != nil {
+			continue
+		}
+		for _, block := range contentBlocks {
+			if len(block.CacheControl) > 0 {
+				text := block.GetText()
+				if text != "" {
+					totalCacheTokens += service.CountTextToken(text, model)
+					cacheContentBuilder.WriteString(text)
+				}
+				if ttl == "" {
+					var cc map[string]string
+					if json.Unmarshal(block.CacheControl, &cc) == nil {
+						if t, ok := cc["ttl"]; ok && (t == "5m" || t == "1h") {
+							ttl = t
+						}
+					}
+				}
+			}
+		}
+	}
+
+	if totalCacheTokens == 0 {
+		return 0, 0, ""
+	}
+
+	// 计算缓存内容的 hash
+	hash := sha256.Sum256([]byte(cacheContentBuilder.String()))
+	cacheKey := hex.EncodeToString(hash[:])
+
+	// 确定缓存过期时间
+	var cacheDuration time.Duration
+	if ttl == "1h" {
+		cacheDuration = time.Hour
+	} else {
+		cacheDuration = 5 * time.Minute
+	}
+
+	// 检查是否已缓存
+	now := time.Now()
+	if expireTime, ok := promptCacheStore.Load(cacheKey); ok {
+		if now.Before(expireTime.(time.Time)) {
+			// 缓存命中，返回 cache_read
+			return 0, totalCacheTokens, ttl
+		}
+	}
+
+	// 首次请求或缓存已过期，写入缓存，返回 cache_creation
+	promptCacheStore.Store(cacheKey, now.Add(cacheDuration))
+
+	// 清理过期缓存（简单实现，每次写入时清理）
+	go cleanExpiredCache()
+
+	return totalCacheTokens, 0, ttl
+}
+
+// cleanExpiredCache 清理过期的缓存条目
+func cleanExpiredCache() {
+	now := time.Now()
+	promptCacheStore.Range(func(key, value any) bool {
+		if now.After(value.(time.Time)) {
+			promptCacheStore.Delete(key)
+		}
+		return true
+	})
 }
