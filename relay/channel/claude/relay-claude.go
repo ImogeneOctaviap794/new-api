@@ -1,15 +1,11 @@
 package claude
 
 import (
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"strings"
-	"sync"
-	"time"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/dto"
@@ -984,20 +980,14 @@ func mapToolChoice(toolChoice any, parallelToolCalls *bool) *dto.ClaudeToolChoic
 	return claudeToolChoice
 }
 
-// promptCacheStore 存储已缓存的 prompt hash 及其过期时间
-var promptCacheStore sync.Map // map[string]time.Time
-
 // CalculateCacheTokensFromRequest 根据请求中带 cache_control 的内容计算 token 数
-// 返回 (cacheCreationTokens, cacheReadTokens, ttl)
-// 首次请求返回 cacheCreation，后续相同内容返回 cacheRead
-func CalculateCacheTokensFromRequest(claudeRequest *dto.ClaudeRequest, model string) (int, int, string) {
+// 所有带 cache_control 的内容都按 cache_read (0.1x) 计费
+func CalculateCacheTokensFromRequest(claudeRequest *dto.ClaudeRequest, model string) int {
 	if claudeRequest == nil {
-		return 0, 0, ""
+		return 0
 	}
 
 	totalCacheTokens := 0
-	ttl := ""
-	var cacheContentBuilder strings.Builder
 
 	// 1. 检查 system 中带 cache_control 的内容
 	systemContent := claudeRequest.ParseSystem()
@@ -1006,16 +996,6 @@ func CalculateCacheTokensFromRequest(claudeRequest *dto.ClaudeRequest, model str
 			text := block.GetText()
 			if text != "" {
 				totalCacheTokens += service.CountTextToken(text, model)
-				cacheContentBuilder.WriteString(text)
-			}
-			// 解析 ttl
-			if ttl == "" {
-				var cc map[string]string
-				if json.Unmarshal(block.CacheControl, &cc) == nil {
-					if t, ok := cc["ttl"]; ok && (t == "5m" || t == "1h") {
-						ttl = t
-					}
-				}
 			}
 		}
 	}
@@ -1031,61 +1011,10 @@ func CalculateCacheTokensFromRequest(claudeRequest *dto.ClaudeRequest, model str
 				text := block.GetText()
 				if text != "" {
 					totalCacheTokens += service.CountTextToken(text, model)
-					cacheContentBuilder.WriteString(text)
-				}
-				if ttl == "" {
-					var cc map[string]string
-					if json.Unmarshal(block.CacheControl, &cc) == nil {
-						if t, ok := cc["ttl"]; ok && (t == "5m" || t == "1h") {
-							ttl = t
-						}
-					}
 				}
 			}
 		}
 	}
 
-	if totalCacheTokens == 0 {
-		return 0, 0, ""
-	}
-
-	// 计算缓存内容的 hash
-	hash := sha256.Sum256([]byte(cacheContentBuilder.String()))
-	cacheKey := hex.EncodeToString(hash[:])
-
-	// 确定缓存过期时间
-	var cacheDuration time.Duration
-	if ttl == "1h" {
-		cacheDuration = time.Hour
-	} else {
-		cacheDuration = 5 * time.Minute
-	}
-
-	// 检查是否已缓存
-	now := time.Now()
-	if expireTime, ok := promptCacheStore.Load(cacheKey); ok {
-		if now.Before(expireTime.(time.Time)) {
-			// 缓存命中，返回 cache_read
-			return 0, totalCacheTokens, ttl
-		}
-	}
-
-	// 首次请求或缓存已过期，写入缓存，返回 cache_creation
-	promptCacheStore.Store(cacheKey, now.Add(cacheDuration))
-
-	// 清理过期缓存（简单实现，每次写入时清理）
-	go cleanExpiredCache()
-
-	return totalCacheTokens, 0, ttl
-}
-
-// cleanExpiredCache 清理过期的缓存条目
-func cleanExpiredCache() {
-	now := time.Now()
-	promptCacheStore.Range(func(key, value any) bool {
-		if now.After(value.(time.Time)) {
-			promptCacheStore.Delete(key)
-		}
-		return true
-	})
+	return totalCacheTokens
 }

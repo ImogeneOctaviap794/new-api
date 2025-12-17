@@ -163,23 +163,11 @@ func ClaudeHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIError *typ
 	}
 
 	// 根据请求中 cache_control 计算缓存 token（不依赖上游返回）
+	// 所有带 cache_control 的内容都按 cache_read (0.1x) 计费
 	usageData := usage.(*dto.Usage)
-	cacheCreation, cacheRead, ttl := claude.CalculateCacheTokensFromRequest(claudeReq, info.OriginModelName)
-	
-	// 如果上游没有返回缓存信息，使用本地计算的值
-	if usageData.PromptTokensDetails.CachedCreationTokens == 0 && usageData.PromptTokensDetails.CachedTokens == 0 {
-		if cacheCreation > 0 {
-			// 首次请求，写入缓存
-			usageData.PromptTokensDetails.CachedCreationTokens = cacheCreation
-			if ttl == "1h" {
-				usageData.ClaudeCacheCreation1hTokens = cacheCreation
-			} else {
-				usageData.ClaudeCacheCreation5mTokens = cacheCreation
-			}
-		} else if cacheRead > 0 {
-			// 后续请求，读取缓存
-			usageData.PromptTokensDetails.CachedTokens = cacheRead
-		}
+	cacheTokens := claude.CalculateCacheTokensFromRequest(claudeReq, info.OriginModelName)
+	if cacheTokens > 0 && usageData.PromptTokensDetails.CachedTokens == 0 {
+		usageData.PromptTokensDetails.CachedTokens = cacheTokens
 	}
 
 	service.PostClaudeConsumeQuota(c, info, usageData)
