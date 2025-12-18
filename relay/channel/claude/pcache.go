@@ -584,16 +584,24 @@ func applyLocalCacheSimulation(req *dto.ClaudeRequest, model string, usage *dto.
 		return
 	}
 
-	// 如果上游返回0，用本地计算的值完全覆盖（不依赖上游 input_tokens）
+	// 如果上游返回0，用本地计算的值覆盖缓存字段
 	// 条件：上游缓存为0 且 本地有计算结果
 	if upstreamCacheRead == 0 && upstreamCacheCreate == 0 {
 		if result.CacheReadTokens > 0 || result.CacheCreationTokens > 0 {
-			// 完全用本地计算的值，不用上游的 input_tokens
+			// 覆盖缓存字段
 			usage.PromptTokensDetails.CachedTokens = result.CacheReadTokens
 			usage.PromptTokensDetails.CachedCreationTokens = result.CacheCreationTokens
 			usage.ClaudeCacheCreation5mTokens = result.CacheCreation5m
 			usage.ClaudeCacheCreation1hTokens = result.CacheCreation1h
-			usage.PromptTokens = result.InputTokens
+
+			// 计算非缓存的输入 tokens
+			// 使用上游返回的 totalInputTokens 减去缓存 tokens
+			totalCacheTokens := result.CacheReadTokens + result.CacheCreationTokens
+			nonCacheTokens := totalInputTokens - totalCacheTokens
+			if nonCacheTokens < 0 {
+				nonCacheTokens = 0
+			}
+			usage.PromptTokens = nonCacheTokens
 		}
 	}
 }
