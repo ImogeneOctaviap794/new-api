@@ -792,26 +792,24 @@ func HandleStreamResponseData(c *gin.Context, info *relaycommon.RelayInfo, claud
 		if requestMode == RequestModeCompletion {
 		} else {
 			if claudeResponse.Type == "message_start" {
-				// message_start, 获取usage
+				// message_start, 获取 usage 并应用 pcache
 				info.UpstreamModelName = claudeResponse.Message.Model
-			} else if claudeResponse.Type == "content_block_delta" {
-			} else if claudeResponse.Type == "message_delta" {
-				// 在 message_delta 中应用 pcache 并填充缓存字段
+
+				// 在 message_start 中应用 pcache（input_tokens 在这里）
 				if claudeReq, ok := info.Request.(*dto.ClaudeRequest); ok && IsPCacheTargetModel(info.OriginModelName) {
-					// 完全用本地计算的缓存值
 					localUsage := &dto.Usage{}
 					applyLocalCacheSimulation(claudeReq, info.OriginModelName, localUsage)
 
-					// 更新响应体中的缓存字段
+					// 更新 message.usage 中的缓存字段
 					if localUsage.PromptTokensDetails.CachedTokens > 0 || localUsage.PromptTokensDetails.CachedCreationTokens > 0 {
-						claudeResponse.Usage.CacheReadInputTokens = localUsage.PromptTokensDetails.CachedTokens
-						claudeResponse.Usage.CacheCreationInputTokens = localUsage.PromptTokensDetails.CachedCreationTokens
-						claudeResponse.Usage.ClaudeCacheCreation5mTokens = localUsage.ClaudeCacheCreation5mTokens
-						claudeResponse.Usage.ClaudeCacheCreation1hTokens = localUsage.ClaudeCacheCreation1hTokens
-
-						// 如果本地计算了非缓存 tokens，也更新 input_tokens
-						if localUsage.PromptTokens > 0 {
-							claudeResponse.Usage.InputTokens = localUsage.PromptTokens
+						if claudeResponse.Message != nil && claudeResponse.Message.Usage != nil {
+							claudeResponse.Message.Usage.CacheReadInputTokens = localUsage.PromptTokensDetails.CachedTokens
+							claudeResponse.Message.Usage.CacheCreationInputTokens = localUsage.PromptTokensDetails.CachedCreationTokens
+							claudeResponse.Message.Usage.ClaudeCacheCreation5mTokens = localUsage.ClaudeCacheCreation5mTokens
+							claudeResponse.Message.Usage.ClaudeCacheCreation1hTokens = localUsage.ClaudeCacheCreation1hTokens
+							if localUsage.PromptTokens > 0 {
+								claudeResponse.Message.Usage.InputTokens = localUsage.PromptTokens
+							}
 						}
 
 						// 更新 claudeInfo 用于计费
@@ -828,6 +826,8 @@ func HandleStreamResponseData(c *gin.Context, info *relaycommon.RelayInfo, claud
 				// 重新序列化
 				newData, _ := json.Marshal(claudeResponse)
 				data = string(newData)
+			} else if claudeResponse.Type == "content_block_delta" {
+			} else if claudeResponse.Type == "message_delta" {
 			}
 		}
 		helper.ClaudeChunkData(c, claudeResponse, data)
