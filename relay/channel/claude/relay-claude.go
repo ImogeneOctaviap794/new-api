@@ -802,7 +802,11 @@ func HandleStreamResponseData(c *gin.Context, info *relaycommon.RelayInfo, claud
 
 					// 更新 message.usage 中的缓存字段
 					if localUsage.PromptTokensDetails.CachedTokens > 0 || localUsage.PromptTokensDetails.CachedCreationTokens > 0 {
-						if claudeResponse.Message != nil && claudeResponse.Message.Usage != nil {
+						if claudeResponse.Message != nil {
+							// 确保 Usage 存在
+							if claudeResponse.Message.Usage == nil {
+								claudeResponse.Message.Usage = &dto.ClaudeUsage{}
+							}
 							claudeResponse.Message.Usage.CacheReadInputTokens = localUsage.PromptTokensDetails.CachedTokens
 							claudeResponse.Message.Usage.CacheCreationInputTokens = localUsage.PromptTokensDetails.CachedCreationTokens
 							claudeResponse.Message.Usage.ClaudeCacheCreation5mTokens = localUsage.ClaudeCacheCreation5mTokens
