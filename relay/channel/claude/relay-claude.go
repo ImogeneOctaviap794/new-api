@@ -798,23 +798,30 @@ func HandleStreamResponseData(c *gin.Context, info *relaycommon.RelayInfo, claud
 			} else if claudeResponse.Type == "message_delta" {
 				// 在 message_delta 中应用 pcache 并填充缓存字段
 				if claudeReq, ok := info.Request.(*dto.ClaudeRequest); ok && IsPCacheTargetModel(info.OriginModelName) {
-					// 使用上游返回的 input_tokens
-					totalInputTokens := claudeResponse.Usage.InputTokens
-					if totalInputTokens == 0 {
-						totalInputTokens = claudeInfo.Usage.PromptTokens
-					}
-					if totalInputTokens > 0 {
-						// 检查上游缓存是否为0
-						if claudeResponse.Usage.CacheReadInputTokens == 0 && claudeResponse.Usage.CacheCreationInputTokens == 0 {
-							result := ProcessPromptCache(claudeReq, info.OriginModelName, totalInputTokens)
-							if result != nil && (result.CacheReadTokens > 0 || result.CacheCreationTokens > 0) {
-								claudeResponse.Usage.CacheReadInputTokens = result.CacheReadTokens
-								claudeResponse.Usage.CacheCreationInputTokens = result.CacheCreationTokens
-								// 更新 claudeInfo 用于计费
-								claudeInfo.CacheReadTokens = result.CacheReadTokens
-								claudeInfo.Usage.PromptTokensDetails.CachedTokens = result.CacheReadTokens
-								claudeInfo.Usage.PromptTokensDetails.CachedCreationTokens = result.CacheCreationTokens
-							}
+					// 完全用本地计算的缓存值
+					localUsage := &dto.Usage{}
+					applyLocalCacheSimulation(claudeReq, info.OriginModelName, localUsage)
+
+					// 更新响应体中的缓存字段
+					if localUsage.PromptTokensDetails.CachedTokens > 0 || localUsage.PromptTokensDetails.CachedCreationTokens > 0 {
+						claudeResponse.Usage.CacheReadInputTokens = localUsage.PromptTokensDetails.CachedTokens
+						claudeResponse.Usage.CacheCreationInputTokens = localUsage.PromptTokensDetails.CachedCreationTokens
+						claudeResponse.Usage.ClaudeCacheCreation5mTokens = localUsage.ClaudeCacheCreation5mTokens
+						claudeResponse.Usage.ClaudeCacheCreation1hTokens = localUsage.ClaudeCacheCreation1hTokens
+
+						// 如果本地计算了非缓存 tokens，也更新 input_tokens
+						if localUsage.PromptTokens > 0 {
+							claudeResponse.Usage.InputTokens = localUsage.PromptTokens
+						}
+
+						// 更新 claudeInfo 用于计费
+						claudeInfo.CacheReadTokens = localUsage.PromptTokensDetails.CachedTokens
+						claudeInfo.Usage.PromptTokensDetails.CachedTokens = localUsage.PromptTokensDetails.CachedTokens
+						claudeInfo.Usage.PromptTokensDetails.CachedCreationTokens = localUsage.PromptTokensDetails.CachedCreationTokens
+						claudeInfo.Usage.ClaudeCacheCreation5mTokens = localUsage.ClaudeCacheCreation5mTokens
+						claudeInfo.Usage.ClaudeCacheCreation1hTokens = localUsage.ClaudeCacheCreation1hTokens
+						if localUsage.PromptTokens > 0 {
+							claudeInfo.Usage.PromptTokens = localUsage.PromptTokens
 						}
 					}
 				}
