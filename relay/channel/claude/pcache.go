@@ -651,13 +651,22 @@ func applyLocalCacheSimulation(req *dto.ClaudeRequest, model string, usage *dto.
 		nonCacheTokens = 0
 	}
 
+	// 如果没有缓存活动，不覆盖上游值
+	if cacheReadTokens == 0 && cacheCreateTokens == 0 {
+		return
+	}
+
 	// 存储缓存断点
 	go StoreCacheBreakpoints(req, model)
 
-	// 覆盖 usage，完全用本地计算的值
+	// 覆盖缓存相关字段
 	usage.PromptTokensDetails.CachedTokens = cacheReadTokens
 	usage.PromptTokensDetails.CachedCreationTokens = cacheCreateTokens
 	usage.ClaudeCacheCreation5mTokens = cacheCreate5m
 	usage.ClaudeCacheCreation1hTokens = cacheCreate1h
-	usage.PromptTokens = nonCacheTokens
+
+	// 只有当 nonCacheTokens > 0 时才覆盖 PromptTokens，否则保留上游值
+	if nonCacheTokens > 0 {
+		usage.PromptTokens = nonCacheTokens
+	}
 }
