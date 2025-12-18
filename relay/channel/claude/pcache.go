@@ -126,52 +126,64 @@ func CalculatePrefixHash(prefix *CachePrefix, model string) string {
 
 // ========== Prefix Extraction ==========
 
-// ExtractCacheBreakpointsWithTotal 返回 breakpoints 和总的本地 tokens
-func ExtractCacheBreakpointsWithTotal(req *dto.ClaudeRequest, model string) ([]CacheBreakpoint, int) {
+// ExtractCacheBreakpointsWithTotal 返回 breakpoints、总的本地 tokens、tools tokens
+func ExtractCacheBreakpointsWithTotal(req *dto.ClaudeRequest, model string) ([]CacheBreakpoint, int, int) {
 	breakpoints := make([]CacheBreakpoint, 0, MaxBreakpoints)
 	globalBlockIndex := 0
-	runningTokenCount := 0
+	totalTokens := 0
+	toolsTokens := 0
 
-	// 1. Process tools - 只计算 tokens，不创建缓存 breakpoint
+	// 1. Process tools - 只计算 tokens，不创建缓存 breakpoint，不计入缓存
 	if req.Tools != nil {
 		tools := req.GetTools()
 		for _, tool := range tools {
 			toolBytes, _ := json.Marshal(tool)
-			runningTokenCount += estimateContentTokens(toolBytes, model)
+			tokens := estimateContentTokens(toolBytes, model)
+			toolsTokens += tokens
+			totalTokens += tokens
 			globalBlockIndex++
 		}
 	}
+
+	// 缓存 tokens 从这里开始计算（不包含 tools）
+	cacheableTokens := 0
 
 	// 2. Process system - 只有带 cache_control 标记的才创建 breakpoint
 	if req.System != nil && !req.IsStringSystem() {
 		systemMedia := req.ParseSystem()
 		for i, media := range systemMedia {
 			mediaBytes, _ := json.Marshal(media)
-			runningTokenCount += estimateContentTokens(mediaBytes, model)
+			tokens := estimateContentTokens(mediaBytes, model)
+			cacheableTokens += tokens
+			totalTokens += tokens
 			globalBlockIndex++
 			if len(media.CacheControl) > 0 {
 				if ttl := extractCacheControlTTLFromRaw(media.CacheControl); ttl != "" {
 					breakpoints = append(breakpoints, CacheBreakpoint{
 						Location: "system", Index: i, BlockIndex: globalBlockIndex,
-						TTL: ttl, TokenCount: runningTokenCount,
+						TTL: ttl, TokenCount: cacheableTokens, // 只计算 system+messages，不含 tools
 					})
 				}
 			}
 		}
 	} else if req.System != nil {
-		runningTokenCount += estimateTokens(req.GetStringSystem(), model)
+		tokens := estimateTokens(req.GetStringSystem(), model)
+		cacheableTokens += tokens
+		totalTokens += tokens
 		globalBlockIndex++
 	}
 
 	// 3. Process messages - 只有带 cache_control 标记的才创建 breakpoint
 	for i, msg := range req.Messages {
 		msgBytes, _ := json.Marshal(msg)
-		runningTokenCount += estimateContentTokens(msgBytes, model)
+		tokens := estimateContentTokens(msgBytes, model)
+		cacheableTokens += tokens
+		totalTokens += tokens
 		globalBlockIndex++
 		if ttl := extractCacheControlFromMessage(&msg); ttl != "" {
 			breakpoints = append(breakpoints, CacheBreakpoint{
 				Location: "message", Index: i, BlockIndex: globalBlockIndex,
-				TTL: ttl, TokenCount: runningTokenCount,
+				TTL: ttl, TokenCount: cacheableTokens, // 只计算 system+messages，不含 tools
 			})
 		}
 	}
@@ -180,11 +192,11 @@ func ExtractCacheBreakpointsWithTotal(req *dto.ClaudeRequest, model string) ([]C
 		breakpoints = breakpoints[:MaxBreakpoints]
 	}
 
-	return breakpoints, runningTokenCount
+	return breakpoints, totalTokens, toolsTokens
 }
 
 func ExtractCacheBreakpoints(req *dto.ClaudeRequest, model string) []CacheBreakpoint {
-	breakpoints, _ := ExtractCacheBreakpointsWithTotal(req, model)
+	breakpoints, _, _ := ExtractCacheBreakpointsWithTotal(req, model)
 	return breakpoints
 }
 
@@ -566,10 +578,13 @@ func applyLocalCacheSimulation(req *dto.ClaudeRequest, model string, usage *dto.
 	}
 
 	// 完全用本地计算 tokens
-	breakpoints, localTotalTokens := ExtractCacheBreakpointsWithTotal(req, model)
+	breakpoints, localTotalTokens, toolsTokens := ExtractCacheBreakpointsWithTotal(req, model)
 	if localTotalTokens == 0 {
 		return
 	}
+
+	// 可缓存的 tokens（不含 tools）
+	cacheableTotalTokens := localTotalTokens - toolsTokens
 
 	minTokens := GetMinCacheableTokens(model)
 
@@ -629,9 +644,9 @@ func applyLocalCacheSimulation(req *dto.ClaudeRequest, model string, usage *dto.
 		}
 	}
 
-	// 非缓存的输入 tokens = 总 tokens - 最后一个缓存断点的 tokens
-	// 这样缓存和输入就不会重复计算
-	nonCacheTokens := localTotalTokens - lastCacheTokens
+	// 非缓存的输入 tokens = tools + (可缓存 tokens - 最后一个缓存断点的 tokens)
+	// tools 不缓存，所以算作非缓存输入
+	nonCacheTokens := toolsTokens + (cacheableTotalTokens - lastCacheTokens)
 	if nonCacheTokens < 0 {
 		nonCacheTokens = 0
 	}
