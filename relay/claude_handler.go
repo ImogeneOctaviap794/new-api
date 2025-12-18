@@ -10,7 +10,6 @@ import (
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/dto"
-	"github.com/QuantumNous/new-api/relay/channel/claude"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relay/helper"
 	"github.com/QuantumNous/new-api/service"
@@ -162,14 +161,7 @@ func ClaudeHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIError *typ
 		return newAPIError
 	}
 
-	// 根据请求中 cache_control 计算缓存 token（不依赖上游返回）
-	// 所有带 cache_control 的内容都按 cache_read (0.1x) 计费
 	usageData := usage.(*dto.Usage)
-	cacheTokens := claude.CalculateCacheTokensFromRequest(claudeReq, info.OriginModelName)
-	if cacheTokens > 0 && usageData.PromptTokensDetails.CachedTokens == 0 {
-		usageData.PromptTokensDetails.CachedTokens = cacheTokens
-	}
-
 	service.PostClaudeConsumeQuota(c, info, usageData)
 	return nil
 }

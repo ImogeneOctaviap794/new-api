@@ -257,6 +257,18 @@ func PostClaudeConsumeQuota(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, 
 	cacheCreationTokens5m := usage.ClaudeCacheCreation5mTokens
 	cacheCreationTokens1h := usage.ClaudeCacheCreation1hTokens
 
+	// Claude 官方 usage: input_tokens = cache_read_input_tokens + cache_creation_input_tokens + (non-cached input_tokens)
+	// 这里先把 promptTokens 调整为「非缓存 input_tokens」，再按各自倍率加回，避免重复计费
+	// 注意：只有当 promptTokens 足够大（包含 cache tokens）时才减去，避免上游未包含 cache tokens 时减成负数
+	totalCacheTokens := cacheTokens + cacheCreationTokens
+	if totalCacheTokens > 0 && promptTokens > totalCacheTokens {
+		// promptTokens 包含了 cache tokens，需要减去
+		promptTokens -= totalCacheTokens
+	} else if totalCacheTokens > 0 && promptTokens <= totalCacheTokens {
+		// promptTokens 不包含 cache tokens（上游已单独返回），不需要减去
+		// 保持 promptTokens 不变，它就是非缓存 input tokens
+	}
+
 	if relayInfo.ChannelType == constant.ChannelTypeOpenRouter {
 		promptTokens -= cacheTokens
 		isUsingCustomSettings := relayInfo.PriceData.UsePrice || hasCustomModelRatio(modelName, relayInfo.PriceData.ModelRatio)

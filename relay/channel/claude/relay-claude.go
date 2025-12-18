@@ -721,12 +721,13 @@ func ResponseClaude2OpenAI(reqMode int, claudeResponse *dto.ClaudeResponse) *dto
 }
 
 type ClaudeResponseInfo struct {
-	ResponseId   string
-	Created      int64
-	Model        string
-	ResponseText strings.Builder
-	Usage        *dto.Usage
-	Done         bool
+	ResponseId      string
+	Created         int64
+	Model           string
+	ResponseText    strings.Builder
+	Usage           *dto.Usage
+	Done            bool
+	CacheReadTokens int // 用于流式响应中填充缓存字段
 }
 
 func FormatClaudeResponseInfo(requestMode int, claudeResponse *dto.ClaudeResponse, oaiResponse *dto.ChatCompletionsStreamResponse, claudeInfo *ClaudeResponseInfo) bool {
@@ -795,6 +796,31 @@ func HandleStreamResponseData(c *gin.Context, info *relaycommon.RelayInfo, claud
 				info.UpstreamModelName = claudeResponse.Message.Model
 			} else if claudeResponse.Type == "content_block_delta" {
 			} else if claudeResponse.Type == "message_delta" {
+				// 在 message_delta 中应用 pcache 并填充缓存字段
+				if claudeReq, ok := info.Request.(*dto.ClaudeRequest); ok && IsPCacheTargetModel(info.OriginModelName) {
+					// 使用上游返回的 input_tokens
+					totalInputTokens := claudeResponse.Usage.InputTokens
+					if totalInputTokens == 0 {
+						totalInputTokens = claudeInfo.Usage.PromptTokens
+					}
+					if totalInputTokens > 0 {
+						// 检查上游缓存是否为0
+						if claudeResponse.Usage.CacheReadInputTokens == 0 && claudeResponse.Usage.CacheCreationInputTokens == 0 {
+							result := ProcessPromptCache(claudeReq, info.OriginModelName, totalInputTokens)
+							if result != nil && (result.CacheReadTokens > 0 || result.CacheCreationTokens > 0) {
+								claudeResponse.Usage.CacheReadInputTokens = result.CacheReadTokens
+								claudeResponse.Usage.CacheCreationInputTokens = result.CacheCreationTokens
+								// 更新 claudeInfo 用于计费
+								claudeInfo.CacheReadTokens = result.CacheReadTokens
+								claudeInfo.Usage.PromptTokensDetails.CachedTokens = result.CacheReadTokens
+								claudeInfo.Usage.PromptTokensDetails.CachedCreationTokens = result.CacheCreationTokens
+							}
+						}
+					}
+				}
+				// 重新序列化
+				newData, _ := json.Marshal(claudeResponse)
+				data = string(newData)
 			}
 		}
 		helper.ClaudeChunkData(c, claudeResponse, data)
@@ -845,11 +871,11 @@ func HandleStreamFinalResponse(c *gin.Context, info *relaycommon.RelayInfo, clau
 
 func ClaudeStreamHandler(c *gin.Context, resp *http.Response, info *relaycommon.RelayInfo, requestMode int) (*dto.Usage, *types.NewAPIError) {
 	claudeInfo := &ClaudeResponseInfo{
-		ResponseId:   helper.GetResponseID(c),
-		Created:      common.GetTimestamp(),
-		Model:        info.UpstreamModelName,
-		ResponseText: strings.Builder{},
-		Usage:        &dto.Usage{},
+		ResponseId:      helper.GetResponseID(c),
+		Created:         common.GetTimestamp(),
+		Model:           info.UpstreamModelName,
+		ResponseText:    strings.Builder{},
+		Usage:           &dto.Usage{},
 	}
 	var err *types.NewAPIError
 	helper.StreamScannerHandler(c, resp, info, func(data string) bool {
@@ -864,6 +890,12 @@ func ClaudeStreamHandler(c *gin.Context, resp *http.Response, info *relaycommon.
 	}
 
 	HandleStreamFinalResponse(c, info, claudeInfo, requestMode)
+
+	// 流式响应：pcache 用于修正计费的 usage（响应体已发送）
+	if claudeReq, ok := info.Request.(*dto.ClaudeRequest); ok && IsPCacheTargetModel(info.OriginModelName) {
+		applyLocalCacheSimulation(claudeReq, info.OriginModelName, claudeInfo.Usage)
+	}
+
 	return claudeInfo.Usage, nil
 }
 
@@ -887,6 +919,15 @@ func HandleClaudeResponseData(c *gin.Context, info *relaycommon.RelayInfo, claud
 		claudeInfo.Usage.ClaudeCacheCreation5mTokens = claudeResponse.Usage.GetCacheCreation5mTokens()
 		claudeInfo.Usage.ClaudeCacheCreation1hTokens = claudeResponse.Usage.GetCacheCreation1hTokens()
 	}
+
+	// 在构建响应数据之前应用 pcache
+	if claudeReq, ok := info.Request.(*dto.ClaudeRequest); ok && IsPCacheTargetModel(info.OriginModelName) {
+		applyLocalCacheSimulation(claudeReq, info.OriginModelName, claudeInfo.Usage)
+		// 同步更新 claudeResponse.Usage 以便正确序列化
+		claudeResponse.Usage.CacheReadInputTokens = claudeInfo.Usage.PromptTokensDetails.CachedTokens
+		claudeResponse.Usage.CacheCreationInputTokens = claudeInfo.Usage.PromptTokensDetails.CachedCreationTokens
+	}
+
 	var responseData []byte
 	switch info.RelayFormat {
 	case types.RelayFormatOpenAI:
@@ -897,7 +938,11 @@ func HandleClaudeResponseData(c *gin.Context, info *relaycommon.RelayInfo, claud
 			return types.NewError(err, types.ErrorCodeBadResponseBody)
 		}
 	case types.RelayFormatClaude:
-		responseData = data
+		// 重新序列化以包含缓存字段
+		responseData, err = json.Marshal(claudeResponse)
+		if err != nil {
+			responseData = data
+		}
 	}
 
 	if claudeResponse.Usage.ServerToolUse != nil && claudeResponse.Usage.ServerToolUse.WebSearchRequests > 0 {
@@ -910,13 +955,12 @@ func HandleClaudeResponseData(c *gin.Context, info *relaycommon.RelayInfo, claud
 
 func ClaudeHandler(c *gin.Context, resp *http.Response, info *relaycommon.RelayInfo, requestMode int) (*dto.Usage, *types.NewAPIError) {
 	defer service.CloseResponseBodyGracefully(resp)
-
 	claudeInfo := &ClaudeResponseInfo{
-		ResponseId:   helper.GetResponseID(c),
-		Created:      common.GetTimestamp(),
-		Model:        info.UpstreamModelName,
-		ResponseText: strings.Builder{},
-		Usage:        &dto.Usage{},
+		ResponseId:      helper.GetResponseID(c),
+		Created:         common.GetTimestamp(),
+		Model:           info.UpstreamModelName,
+		ResponseText:    strings.Builder{},
+		Usage:           &dto.Usage{},
 	}
 	responseBody, err := io.ReadAll(resp.Body)
 	if err != nil {
@@ -929,6 +973,8 @@ func ClaudeHandler(c *gin.Context, resp *http.Response, info *relaycommon.RelayI
 	if handleErr != nil {
 		return nil, handleErr
 	}
+
+	// pcache 已在 HandleClaudeResponseData 中应用
 	return claudeInfo.Usage, nil
 }
 
@@ -980,60 +1026,63 @@ func mapToolChoice(toolChoice any, parallelToolCalls *bool) *dto.ClaudeToolChoic
 	return claudeToolChoice
 }
 
-// CalculateCacheTokensFromRequest 根据请求中带 cache_control 的内容计算 token 数
-// 所有带 cache_control 的内容都按 cache_read (0.1x) 计费
+// CalculateCacheTokensFromRequest 根据请求中 cache_control 计算缓存 token 数
+// Anthropic 缓存机制：从请求开头到最后一个 cache_control 标记点的内容被缓存
+// 只计算 system + tools（静态部分），不计算 messages（动态部分）
+// 所有缓存内容按 cache_read (0.1x) 计费
 func CalculateCacheTokensFromRequest(claudeRequest *dto.ClaudeRequest, model string) int {
 	if claudeRequest == nil {
 		return 0
 	}
 
 	totalCacheTokens := 0
+	hasCacheControl := false
 
-	// 1. 检查 system 中带 cache_control 的内容
+	// 1. 计算 system 的 token（如果有 cache_control）
 	systemContent := claudeRequest.ParseSystem()
+	var systemTexts []string
 	for _, block := range systemContent {
+		text := block.GetText()
+		if text != "" {
+			systemTexts = append(systemTexts, text)
+		}
 		if len(block.CacheControl) > 0 {
-			text := block.GetText()
-			if text != "" {
-				totalCacheTokens += service.CountTextToken(text, model)
-			}
+			hasCacheControl = true
 		}
 	}
 
-	// 2. 检查 messages 中带 cache_control 的内容
-	for _, msg := range claudeRequest.Messages {
-		contentBlocks, err := msg.ParseContent()
-		if err != nil {
-			continue
-		}
-		for _, block := range contentBlocks {
-			if len(block.CacheControl) > 0 {
-				text := block.GetText()
-				if text != "" {
-					totalCacheTokens += service.CountTextToken(text, model)
-				}
-			}
-		}
-	}
-
-	// 3. 检查 tools 中带 cache_control 的内容
+	// 2. 计算 tools 的 token（如果有 cache_control）
+	var toolsTexts []string
 	if claudeRequest.Tools != nil {
 		tools := claudeRequest.GetTools()
 		normalTools, _ := dto.ProcessTools(tools)
 		for _, tool := range normalTools {
+			if tool.Name != "" {
+				toolsTexts = append(toolsTexts, tool.Name)
+			}
+			if tool.Description != "" {
+				toolsTexts = append(toolsTexts, tool.Description)
+			}
+			if tool.InputSchema != nil {
+				schemaBytes, _ := json.Marshal(tool.InputSchema)
+				toolsTexts = append(toolsTexts, string(schemaBytes))
+			}
 			if len(tool.CacheControl) > 0 {
-				// 计算工具的 token 数：name + description + input_schema
-				toolText := tool.Name
-				if tool.Description != "" {
-					toolText += " " + tool.Description
-				}
-				if tool.InputSchema != nil {
-					schemaBytes, _ := json.Marshal(tool.InputSchema)
-					toolText += " " + string(schemaBytes)
-				}
-				totalCacheTokens += service.CountTextToken(toolText, model)
+				hasCacheControl = true
 			}
 		}
+	}
+
+	// 如果没有 cache_control 标记，返回 0
+	if !hasCacheControl {
+		return 0
+	}
+
+	// 计算 system + tools 的 token 数
+	allTexts := append(systemTexts, toolsTexts...)
+	if len(allTexts) > 0 {
+		combinedText := strings.Join(allTexts, "\n")
+		totalCacheTokens = service.CountTextToken(combinedText, model)
 	}
 
 	return totalCacheTokens
