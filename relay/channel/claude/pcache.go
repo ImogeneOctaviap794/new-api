@@ -574,12 +574,6 @@ func applyLocalCacheSimulation(req *dto.ClaudeRequest, model string, usage *dto.
 		return
 	}
 
-	// Extract breakpoints for debugging
-	breakpoints := ExtractCacheBreakpoints(req, model)
-	minTokens := GetMinCacheableTokens(model)
-	common.SysLog(fmt.Sprintf("pcache: model=%s, inputTokens=%d, minCacheable=%d, breakpoints=%d",
-		model, totalInputTokens, minTokens, len(breakpoints)))
-
 	// Log upstream values before override
 	upstreamCacheRead := usage.PromptTokensDetails.CachedTokens
 	upstreamCacheCreate := usage.PromptTokensDetails.CachedCreationTokens
@@ -589,10 +583,6 @@ func applyLocalCacheSimulation(req *dto.ClaudeRequest, model string, usage *dto.
 	if result == nil {
 		return
 	}
-
-	// Log result even if no cache data (for debugging)
-	common.SysLog(fmt.Sprintf("pcache: result hit=%v, read=%d, create=%d, input=%d",
-		result.Hit, result.CacheReadTokens, result.CacheCreationTokens, result.InputTokens))
 
 	// 如果上游返回0，用本地计算的值完全覆盖（不依赖上游 input_tokens）
 	// 条件：上游缓存为0 且 本地有计算结果
@@ -604,9 +594,6 @@ func applyLocalCacheSimulation(req *dto.ClaudeRequest, model string, usage *dto.
 			usage.ClaudeCacheCreation5mTokens = result.CacheCreation5m
 			usage.ClaudeCacheCreation1hTokens = result.CacheCreation1h
 			usage.PromptTokens = result.InputTokens
-
-			common.SysLog(fmt.Sprintf("pcache: model=%s hit=%v local_calc -> cache_read=%d cache_create=%d prompt=%d",
-				model, result.Hit, result.CacheReadTokens, result.CacheCreationTokens, result.InputTokens))
 		}
 	}
 }
