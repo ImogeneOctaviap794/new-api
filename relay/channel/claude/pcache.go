@@ -126,7 +126,8 @@ func CalculatePrefixHash(prefix *CachePrefix, model string) string {
 
 // ========== Prefix Extraction ==========
 
-func ExtractCacheBreakpoints(req *dto.ClaudeRequest, model string) []CacheBreakpoint {
+// ExtractCacheBreakpointsWithTotal 返回 breakpoints 和总的本地 tokens
+func ExtractCacheBreakpointsWithTotal(req *dto.ClaudeRequest, model string) ([]CacheBreakpoint, int) {
 	breakpoints := make([]CacheBreakpoint, 0, MaxBreakpoints)
 	globalBlockIndex := 0
 	runningTokenCount := 0
@@ -136,10 +137,8 @@ func ExtractCacheBreakpoints(req *dto.ClaudeRequest, model string) []CacheBreakp
 		tools := req.GetTools()
 		for _, tool := range tools {
 			toolBytes, _ := json.Marshal(tool)
-			// 使用 estimateContentTokens 减少 JSON 膨胀
 			runningTokenCount += estimateContentTokens(toolBytes, model)
 			globalBlockIndex++
-			// tools 不缓存，跳过 breakpoint 创建
 		}
 	}
 
@@ -148,7 +147,6 @@ func ExtractCacheBreakpoints(req *dto.ClaudeRequest, model string) []CacheBreakp
 		systemMedia := req.ParseSystem()
 		for i, media := range systemMedia {
 			mediaBytes, _ := json.Marshal(media)
-			// 使用 estimateContentTokens 减少 JSON 膨胀
 			runningTokenCount += estimateContentTokens(mediaBytes, model)
 			globalBlockIndex++
 			if len(media.CacheControl) > 0 {
@@ -168,7 +166,6 @@ func ExtractCacheBreakpoints(req *dto.ClaudeRequest, model string) []CacheBreakp
 	// 3. Process messages - 只有带 cache_control 标记的才创建 breakpoint
 	for i, msg := range req.Messages {
 		msgBytes, _ := json.Marshal(msg)
-		// 使用 estimateContentTokens 减少 JSON 膨胀
 		runningTokenCount += estimateContentTokens(msgBytes, model)
 		globalBlockIndex++
 		if ttl := extractCacheControlFromMessage(&msg); ttl != "" {
@@ -183,6 +180,11 @@ func ExtractCacheBreakpoints(req *dto.ClaudeRequest, model string) []CacheBreakp
 		breakpoints = breakpoints[:MaxBreakpoints]
 	}
 
+	return breakpoints, runningTokenCount
+}
+
+func ExtractCacheBreakpoints(req *dto.ClaudeRequest, model string) []CacheBreakpoint {
+	breakpoints, _ := ExtractCacheBreakpointsWithTotal(req, model)
 	return breakpoints
 }
 
@@ -557,47 +559,90 @@ func ProcessPromptCache(req *dto.ClaudeRequest, model string, totalInputTokens i
 }
 
 // applyLocalCacheSimulation applies local prompt cache simulation to usage
-// This function overrides the upstream cache tokens with locally calculated values
+// This function uses fully local token calculation, not upstream values
 func applyLocalCacheSimulation(req *dto.ClaudeRequest, model string, usage *dto.Usage) {
 	if req == nil || usage == nil {
 		return
 	}
 
-	// Get total input tokens from upstream (or estimate if not available)
-	totalInputTokens := usage.PromptTokens
-	if totalInputTokens == 0 {
+	// 完全用本地计算 tokens
+	breakpoints, localTotalTokens := ExtractCacheBreakpointsWithTotal(req, model)
+	if localTotalTokens == 0 {
 		return
 	}
 
-	// Log upstream values before override
-	upstreamCacheRead := usage.PromptTokensDetails.CachedTokens
-	upstreamCacheCreate := usage.PromptTokensDetails.CachedCreationTokens
+	minTokens := GetMinCacheableTokens(model)
 
-	// Process cache and get result
-	result := ProcessPromptCache(req, model, totalInputTokens)
-	if result == nil {
-		return
-	}
+	// 计算缓存 tokens
+	var cacheReadTokens, cacheCreateTokens, cacheCreate5m, cacheCreate1h int
+	var lastCacheTokens int
 
-	// 如果上游返回0，用本地计算的值覆盖缓存字段
-	// 条件：上游缓存为0 且 本地有计算结果
-	if upstreamCacheRead == 0 && upstreamCacheCreate == 0 {
-		if result.CacheReadTokens > 0 || result.CacheCreationTokens > 0 {
-			// 计算非缓存的输入 tokens
-			totalCacheTokens := result.CacheReadTokens + result.CacheCreationTokens
-			nonCacheTokens := totalInputTokens - totalCacheTokens
+	// 检查缓存命中
+	for i := len(breakpoints) - 1; i >= 0; i-- {
+		bp := breakpoints[i]
+		if bp.TokenCount < minTokens {
+			continue
+		}
 
-			// 如果计算结果为 0 或负数，不覆盖上游值，直接返回
-			if nonCacheTokens <= 0 {
-				return
+		prefix := BuildPrefixUpToBreakpoint(req, bp)
+		hash := CalculatePrefixHash(prefix, model)
+		entry, err := GetCacheEntry(model, hash)
+
+		if err == nil && entry != nil {
+			// 缓存命中
+			cacheReadTokens = bp.TokenCount
+			lastCacheTokens = bp.TokenCount
+
+			// 检查命中点之后是否有新的缓存需要创建
+			for j := i + 1; j < len(breakpoints); j++ {
+				nextBp := breakpoints[j]
+				if nextBp.TokenCount >= minTokens {
+					createTokens := nextBp.TokenCount - lastCacheTokens
+					if nextBp.TTL == "1h" {
+						cacheCreate1h += createTokens
+					} else {
+						cacheCreate5m += createTokens
+					}
+					cacheCreateTokens += createTokens
+					lastCacheTokens = nextBp.TokenCount
+				}
 			}
-
-			// 覆盖缓存字段
-			usage.PromptTokensDetails.CachedTokens = result.CacheReadTokens
-			usage.PromptTokensDetails.CachedCreationTokens = result.CacheCreationTokens
-			usage.ClaudeCacheCreation5mTokens = result.CacheCreation5m
-			usage.ClaudeCacheCreation1hTokens = result.CacheCreation1h
-			usage.PromptTokens = nonCacheTokens
+			break
 		}
 	}
+
+	// 如果没有命中，所有 breakpoints 都需要创建缓存
+	if cacheReadTokens == 0 && len(breakpoints) > 0 {
+		prevTokens := 0
+		for _, bp := range breakpoints {
+			if bp.TokenCount >= minTokens {
+				createTokens := bp.TokenCount - prevTokens
+				if bp.TTL == "1h" {
+					cacheCreate1h += createTokens
+				} else {
+					cacheCreate5m += createTokens
+				}
+				cacheCreateTokens += createTokens
+				prevTokens = bp.TokenCount
+				lastCacheTokens = bp.TokenCount
+			}
+		}
+	}
+
+	// 非缓存的输入 tokens = 总 tokens - 最后一个缓存断点的 tokens
+	// 这样缓存和输入就不会重复计算
+	nonCacheTokens := localTotalTokens - lastCacheTokens
+	if nonCacheTokens < 0 {
+		nonCacheTokens = 0
+	}
+
+	// 存储缓存断点
+	go StoreCacheBreakpoints(req, model)
+
+	// 覆盖 usage，完全用本地计算的值
+	usage.PromptTokensDetails.CachedTokens = cacheReadTokens
+	usage.PromptTokensDetails.CachedCreationTokens = cacheCreateTokens
+	usage.ClaudeCacheCreation5mTokens = cacheCreate5m
+	usage.ClaudeCacheCreation1hTokens = cacheCreate1h
+	usage.PromptTokens = nonCacheTokens
 }
