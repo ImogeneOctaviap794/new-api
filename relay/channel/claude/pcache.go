@@ -131,20 +131,15 @@ func ExtractCacheBreakpoints(req *dto.ClaudeRequest, model string) []CacheBreakp
 	globalBlockIndex := 0
 	runningTokenCount := 0
 
-	// 1. Process tools - 只有带 cache_control 标记的才创建 breakpoint
+	// 1. Process tools - 只计算 tokens，不创建缓存 breakpoint
 	if req.Tools != nil {
 		tools := req.GetTools()
-		for i, tool := range tools {
+		for _, tool := range tools {
 			toolBytes, _ := json.Marshal(tool)
 			// 使用 estimateContentTokens 减少 JSON 膨胀
 			runningTokenCount += estimateContentTokens(toolBytes, model)
 			globalBlockIndex++
-			if ttl := extractCacheControlTTL(toolBytes); ttl != "" {
-				breakpoints = append(breakpoints, CacheBreakpoint{
-					Location: "tools", Index: i, BlockIndex: globalBlockIndex,
-					TTL: ttl, TokenCount: runningTokenCount,
-				})
-			}
+			// tools 不缓存，跳过 breakpoint 创建
 		}
 	}
 
