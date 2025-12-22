@@ -902,10 +902,8 @@ func ClaudeStreamHandler(c *gin.Context, resp *http.Response, info *relaycommon.
 
 	HandleStreamFinalResponse(c, info, claudeInfo, requestMode)
 
-	// 流式响应：pcache 用于修正计费的 usage（响应体已发送）
-	if claudeReq, ok := info.Request.(*dto.ClaudeRequest); ok && IsPCacheTargetModel(info.OriginModelName) {
-		applyLocalCacheSimulation(claudeReq, info.OriginModelName, claudeInfo.Usage)
-	}
+	// 注意：pcache 已在 message_start 中处理，不要重复调用
+	// 否则会导致计费和下游返回不一致（第一次创建缓存，第二次读取缓存）
 
 	return claudeInfo.Usage, nil
 }
