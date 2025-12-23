@@ -18,6 +18,7 @@ import (
 
 const (
 	PCacheKeyPrefix           = "pcache"
+	PCacheFuzzyPrefix         = "pcache_fuzzy" // 模糊匹配前缀
 	TTL5m                     = 5 * time.Minute
 	TTL1h                     = 1 * time.Hour
 	MaxBreakpoints            = 4
@@ -382,6 +383,64 @@ func GetCacheKey(model string, hash string) string {
 	return fmt.Sprintf("%s:%s:%s", PCacheKeyPrefix, model, hash)
 }
 
+// GetFuzzyCacheKey 返回基于 system prompt 的模糊缓存键
+func GetFuzzyCacheKey(model string, systemHash string) string {
+	return fmt.Sprintf("%s:%s:%s", PCacheFuzzyPrefix, model, systemHash)
+}
+
+// CalculateSystemHash 计算 system prompt 的哈希（用于模糊匹配）
+func CalculateSystemHash(req *dto.ClaudeRequest, model string) string {
+	if req.System == nil {
+		return ""
+	}
+	var systemBytes []byte
+	if req.IsStringSystem() {
+		systemBytes, _ = json.Marshal(req.GetStringSystem())
+	} else {
+		systemMedia := req.ParseSystem()
+		systemBytes, _ = json.Marshal(systemMedia)
+	}
+	data := map[string]interface{}{"model": model, "system": systemBytes}
+	jsonBytes, _ := json.Marshal(data)
+	hash := sha256.Sum256(jsonBytes)
+	return hex.EncodeToString(hash[:])
+}
+
+// StoreFuzzyEntry 存储模糊匹配条目（基于 system prompt）
+func StoreFuzzyEntry(model string, systemHash string, tokenCount int, ttl string) error {
+	if !common.RedisEnabled || systemHash == "" {
+		return nil
+	}
+	key := GetFuzzyCacheKey(model, systemHash)
+	expiry := TTL5m
+	if ttl == "1h" {
+		expiry = TTL1h
+	}
+	data := map[string]interface{}{"tokens": tokenCount, "ttl": ttl}
+	jsonBytes, _ := json.Marshal(data)
+	return common.RedisSet(key, string(jsonBytes), expiry)
+}
+
+// GetFuzzyEntry 检查模糊匹配条目是否存在
+func GetFuzzyEntry(model string, systemHash string) (int, bool) {
+	if !common.RedisEnabled || systemHash == "" {
+		return 0, false
+	}
+	key := GetFuzzyCacheKey(model, systemHash)
+	data, err := common.RedisGet(key)
+	if err != nil || data == "" {
+		return 0, false
+	}
+	var entry map[string]interface{}
+	if err := json.Unmarshal([]byte(data), &entry); err != nil {
+		return 0, false
+	}
+	if tokens, ok := entry["tokens"].(float64); ok {
+		return int(tokens), true
+	}
+	return 0, false
+}
+
 func StoreCacheEntry(entry *CacheEntry) error {
 	if !common.RedisEnabled {
 		return nil // Redis not enabled, skip silently
@@ -572,6 +631,7 @@ func ProcessPromptCache(req *dto.ClaudeRequest, model string, totalInputTokens i
 
 // applyLocalCacheSimulation applies local prompt cache simulation to usage
 // This function uses fully local token calculation, not upstream values
+// 策略：多判命中少判创建 - 使用模糊匹配优先判定为命中
 func applyLocalCacheSimulation(req *dto.ClaudeRequest, model string, usage *dto.Usage) {
 	if req == nil || usage == nil {
 		return
@@ -591,8 +651,9 @@ func applyLocalCacheSimulation(req *dto.ClaudeRequest, model string, usage *dto.
 	// 计算缓存 tokens
 	var cacheReadTokens, cacheCreateTokens, cacheCreate5m, cacheCreate1h int
 	var lastCacheTokens int
+	var exactHit bool
 
-	// 检查缓存命中
+	// 1. 先尝试精确匹配
 	for i := len(breakpoints) - 1; i >= 0; i-- {
 		bp := breakpoints[i]
 		if bp.TokenCount < minTokens {
@@ -604,7 +665,8 @@ func applyLocalCacheSimulation(req *dto.ClaudeRequest, model string, usage *dto.
 		entry, err := GetCacheEntry(model, hash)
 
 		if err == nil && entry != nil {
-			// 缓存命中
+			// 精确命中
+			exactHit = true
 			cacheReadTokens = bp.TokenCount
 			lastCacheTokens = bp.TokenCount
 
@@ -626,7 +688,38 @@ func applyLocalCacheSimulation(req *dto.ClaudeRequest, model string, usage *dto.
 		}
 	}
 
-	// 如果没有命中，所有 breakpoints 都需要创建缓存
+	// 2. 如果精确匹配失败，尝试模糊匹配（基于 system prompt）
+	// 策略：如果 system prompt 相同，假设 Anthropic 端可能命中
+	if !exactHit && len(breakpoints) > 0 {
+		systemHash := CalculateSystemHash(req, model)
+		if fuzzyTokens, found := GetFuzzyEntry(model, systemHash); found {
+			// 模糊命中：假设第一个断点命中
+			// 使用之前存储的 token 数作为读取量
+			if len(breakpoints) > 0 && breakpoints[0].TokenCount >= minTokens {
+				cacheReadTokens = fuzzyTokens
+				if cacheReadTokens > breakpoints[0].TokenCount {
+					cacheReadTokens = breakpoints[0].TokenCount
+				}
+				lastCacheTokens = cacheReadTokens
+
+				// 后续断点需要创建
+				for _, bp := range breakpoints {
+					if bp.TokenCount > lastCacheTokens && bp.TokenCount >= minTokens {
+						createTokens := bp.TokenCount - lastCacheTokens
+						if bp.TTL == "1h" {
+							cacheCreate1h += createTokens
+						} else {
+							cacheCreate5m += createTokens
+						}
+						cacheCreateTokens += createTokens
+						lastCacheTokens = bp.TokenCount
+					}
+				}
+			}
+		}
+	}
+
+	// 3. 如果都没有命中，所有 breakpoints 都需要创建缓存
 	if cacheReadTokens == 0 && len(breakpoints) > 0 {
 		prevTokens := 0
 		for _, bp := range breakpoints {
@@ -641,6 +734,12 @@ func applyLocalCacheSimulation(req *dto.ClaudeRequest, model string, usage *dto.
 				prevTokens = bp.TokenCount
 				lastCacheTokens = bp.TokenCount
 			}
+		}
+
+		// 存储模糊匹配条目，供后续请求使用
+		if len(breakpoints) > 0 {
+			systemHash := CalculateSystemHash(req, model)
+			go StoreFuzzyEntry(model, systemHash, breakpoints[0].TokenCount, breakpoints[0].TTL)
 		}
 	}
 
